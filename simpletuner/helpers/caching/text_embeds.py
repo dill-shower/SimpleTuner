@@ -1,5 +1,6 @@
 import gc
 import hashlib
+import json
 import logging
 import os
 import queue
@@ -49,6 +50,7 @@ class TextEmbeddingCache(WebhookMixin):
         text_encoder_batch_size: int = 4,
         max_workers: int = 32,
         model: ModelFoundation = None,
+        skip_cache: bool = False,
     ):
         self.id = id
         if data_backend.id != id:
@@ -70,6 +72,7 @@ class TextEmbeddingCache(WebhookMixin):
         self.text_encoder_batch_size = text_encoder_batch_size
         self.max_workers = max_workers
         self.rank_info = rank_info()
+        self.skip_cache_mode = skip_cache
         if self.data_backend.type == "local":
             self.cache_dir = os.path.abspath(self.cache_dir)
         self.data_backend.create_directory(self.cache_dir)
@@ -320,8 +323,25 @@ class TextEmbeddingCache(WebhookMixin):
         is_negative_prompt: bool = False,
     ):
         prompt_embeds_all = []
-        should_encode = not load_from_cache
+        if self.skip_cache_mode:
+            load_from_cache = False
+        should_encode = not load_from_cache or self.skip_cache_mode
         args = StateTracker.get_args()
+        if should_encode:
+            if self.text_encoders is None or all(te is None for te in self.text_encoders):
+                raise RuntimeError("Text encoders not loaded")
+            for idx, te in enumerate(self.text_encoders):
+                if te is not None and te.device.type == 'meta':
+                    raise RuntimeError(f"TE {idx} on meta")
+            for te in self.text_encoders:
+                if te is not None and te.training:
+                    te.eval()
+        target_dtype = torch.bfloat16
+        if should_encode and hasattr(args, 'text_encoder_precision'):
+            if args.text_encoder_precision == 'fp16':
+                target_dtype = torch.float16
+            elif args.text_encoder_precision == 'fp32':
+                target_dtype = torch.float32
         if should_encode:
             local_caption_split = self.split_captions_between_processes(prompts or self.prompts)
         else:
@@ -393,26 +413,24 @@ class TextEmbeddingCache(WebhookMixin):
                             "Cache retrieval for text embed file failed. Ensure your dataloader config value for skip_file_discovery does not contain 'text', and that preserve_data_backend_cache is disabled or unset."
                         )
                 if should_encode:
-                    # If load_from_cache is True, should_encode would be False unless we failed to load.
-                    self.debug_log(
-                        f"Encoding filename {filename} :: device {self.text_encoders[0].device} :: prompt {prompt}"
-                    )
-                    text_encoder_output = self.model.encode_text_batch([prompt], is_negative_prompt=is_negative_prompt)
-                    logger.debug(
-                        f"Filename {filename} prompt embeds: {gather_dict_of_tensors_shapes(tensors=text_encoder_output)}, keys: {text_encoder_output.keys()}"
-                    )
-                    # Get the current size of the queue.
-                    current_size = self.write_queue.qsize()
-                    if current_size >= 2048:
-                        log_msg = str(
-                            f"[WARNING] Write queue size is {current_size}. This is quite large."
-                            " Consider increasing the write batch size. Delaying encode so that writes can catch up."
-                        )
-                        self.write_thread_bar.write(log_msg)
-                        while self.write_queue.qsize() > 100:
-                            time.sleep(0.1)
-                    self.debug_log(f"Adding embed to write queue: {filename}")
-                    self.save_to_cache(filename, text_encoder_output)
+                    with torch.no_grad(), torch.autocast(device_type=self.accelerator.device.type, dtype=target_dtype, enabled=(target_dtype != torch.float32)):
+                        text_encoder_output = self.model.encode_text_batch([prompt], is_negative_prompt=is_negative_prompt)
+                    if "add_text_embeds" in text_encoder_output and "pooled_prompt_embeds" not in text_encoder_output:
+                        text_encoder_output["pooled_prompt_embeds"] = text_encoder_output["add_text_embeds"]
+                    if not self.skip_cache_mode:
+                        current_size = self.write_queue.qsize()
+                        if current_size >= 2048:
+                            log_msg = str(
+                                f"[WARNING] Write queue size is {current_size}. This is quite large."
+                                " Consider increasing the write batch size. Delaying encode so that writes can catch up."
+                            )
+                            self.write_thread_bar.write(log_msg)
+                            while self.write_queue.qsize() > 100:
+                                time.sleep(0.1)
+                        self.debug_log(f"Adding embed to write queue: {filename}")
+                        self.save_to_cache(filename, text_encoder_output)
+                    else:
+                        pass
 
                     if (
                         self.webhook_handler is not None
@@ -438,6 +456,10 @@ class TextEmbeddingCache(WebhookMixin):
 
                 if return_concat:
                     prompt_embeds_all.append(text_encoder_output)
+                if return_concat and prompt_embeds_all and "add_text_embeds" in prompt_embeds_all[0] and "pooled_prompt_embeds" not in prompt_embeds_all[0]:
+                    for o in prompt_embeds_all:
+                        if "add_text_embeds" in o:
+                            o["pooled_prompt_embeds"] = o["add_text_embeds"]
 
             while self.write_queue.qsize() > 0:
                 time.sleep(0.1)  # Sleep briefly to avoid busy-waiting
@@ -458,15 +480,17 @@ class TextEmbeddingCache(WebhookMixin):
                 del prompt_embeds_all
                 return
 
-            logger.debug(f"Returning all {(len(prompt_embeds_all))} prompt embeds")
-            if text_encoder_output is not None and "prompt_embeds" in text_encoder_output:
-                all_prompt_embeds = tuple([v for v in text_encoder_output["prompt_embeds"]])
-                text_encoder_output["prompt_embeds"] = torch.cat(all_prompt_embeds, dim=0)
-            if text_encoder_output is not None and "add_text_embeds" in text_encoder_output:
-                all_pooled_embeds = tuple([v for v in text_encoder_output["add_text_embeds"]])
-                text_encoder_output["add_text_embeds"] = torch.cat(all_pooled_embeds, dim=0)
-
-        return text_encoder_output
+            s = {}
+            if prompt_embeds_all and "prompt_embeds" in prompt_embeds_all[0]:
+                s["prompt_embeds"] = torch.cat([v["prompt_embeds"] for v in prompt_embeds_all], dim=0)
+            if prompt_embeds_all and "pooled_prompt_embeds" in prompt_embeds_all[0]:
+                s["pooled_prompt_embeds"] = torch.cat([v["pooled_prompt_embeds"] for v in prompt_embeds_all], dim=0)
+                s["add_text_embeds"] = s["pooled_prompt_embeds"]
+            if prompt_embeds_all and "attention_masks" in prompt_embeds_all[0]:
+                s["attention_masks"] = torch.cat([v["attention_masks"] for v in prompt_embeds_all], dim=0)
+            if prompt_embeds_all and "time_ids" in prompt_embeds_all[0]:
+                s["time_ids"] = torch.cat([v["time_ids"] for v in prompt_embeds_all], dim=0)
+            return s
 
     def __del__(self):
         """Ensure that the batch write thread is properly closed."""
