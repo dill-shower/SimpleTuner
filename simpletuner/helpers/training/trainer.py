@@ -388,6 +388,35 @@ class Trainer:
 
         self.configure_webhook(raw_config=args_payload if isinstance(args_payload, dict) else args)
         self.config = load_config(args_payload, exit_on_error=exit_on_error)
+        # ============ Text Encoder Cache & Optimization Config ============
+        # Auto-detect if we should use real-time encoding instead of pre-caching
+        if not hasattr(self.config, 'cache_text_encoder_outputs'):
+            caption_strategy = getattr(self.config, 'caption_strategy', '').lower()
+            self.config.cache_text_encoder_outputs = caption_strategy not in ['shuffle', 'random']
+        
+        # Convert string to boolean if user provided it as string in config
+        if isinstance(self.config.cache_text_encoder_outputs, str):
+            self.config.cache_text_encoder_outputs = self.config.cache_text_encoder_outputs.lower() in ['true', '1', 'yes']
+        
+        # Set default for SDPA (PyTorch 2.0 scaled dot product attention)
+        if not hasattr(self.config, 'text_encoder_use_attention_sdpa'):
+            self.config.text_encoder_use_attention_sdpa = True
+        
+        # Set default for optional torch.compile
+        if not hasattr(self.config, 'text_encoder_compile'):
+            self.config.text_encoder_compile = False
+        
+        # Set default compile mode
+        if not hasattr(self.config, 'text_encoder_compile_mode'):
+            self.config.text_encoder_compile_mode = "max-autotune-no-cudagraphs"
+        
+        # Set default precision for text encoders
+        if not hasattr(self.config, 'text_encoder_precision'):
+            self.config.text_encoder_precision = "bf16"
+        
+        # Log the cache status
+        logger.info(f"Text embedding cache: {'ENABLED' if self.config.cache_text_encoder_outputs else 'DISABLED (on-the-fly)'}")
+        
         if self.config is None and args_payload and not skip_config_fallback:
             # Fallback to the user's persisted defaults when ad-hoc CLI args are incomplete.
             # This mirrors historical behaviour where we would silently load the active
@@ -1742,6 +1771,46 @@ class Trainer:
 
     def init_text_encoder(self, move_to_accelerator: bool = True):
         self.model.load_text_encoder(move_to_device=move_to_accelerator)
+        
+        # Apply optimizations to text encoders if we're not training them
+        if not getattr(self.config, 'train_text_encoder', False):
+            for idx, te in enumerate(self.model.text_encoders or []):
+                if te is None:
+                    continue
+
+                # 1) Enable SDPA (Scaled Dot Product Attention) for faster inference
+                if getattr(self.config, 'text_encoder_use_attention_sdpa', True) and hasattr(te, 'set_attn_processor'):
+                    from diffusers.models.attention_processor import AttnProcessor2_0
+                    te.set_attn_processor(AttnProcessor2_0())
+                    logger.info(f"Text encoder {idx}: enabled SDPA")
+
+                # 2) Eval mode
+                te.eval()
+
+                # 3) Optional: Compile with torch.compile for even faster inference
+                if getattr(self.config, 'text_encoder_compile', False):
+                    try:
+                        mode = getattr(self.config, 'text_encoder_compile_mode', 'max-autotune-no-cudagraphs')
+                        if hasattr(te, 'text_model'):
+                            # CLIP-style encoders
+                            te.text_model.encoder = torch.compile(te.text_model.encoder, mode=mode, fullgraph=False)
+                        else:
+                            # T5-style encoders
+                            te.encoder = torch.compile(te.encoder, mode=mode, fullgraph=False)
+                    except Exception as e:
+                        logger.warning(f"Compile failed: {e}")
+
+                # 4) Set precision (bf16/fp16/fp32)
+                target_dtype = self.config.weight_dtype
+                prec = getattr(self.config, 'text_encoder_precision', 'bf16')
+                if prec == 'bf16':
+                    target_dtype = torch.bfloat16
+                elif prec == 'fp16':
+                    target_dtype = torch.float16
+                elif prec == 'fp32':
+                    target_dtype = torch.float32
+                if te.dtype != target_dtype:
+                    te.to(dtype=target_dtype)
 
     def init_freeze_models(self):
         self.model.freeze_components()
@@ -1790,6 +1859,10 @@ class Trainer:
                 )
             )
             distiller_profile = self._resolve_distiller_profile()
+
+            # NEW: inform factory via args that we want on-the-fly encoding
+            self.config.skip_text_encoding = not getattr(self.config, 'cache_text_encoder_outputs', True)
+
             configure_multi_databackend(
                 self.config,
                 accelerator=self.accelerator,
@@ -1925,6 +1998,21 @@ class Trainer:
         return curent_memory_allocated
 
     def init_unload_text_encoder(self):
+        # NEW: keep TE loaded for real-time encoding
+        if not getattr(self.config, 'cache_text_encoder_outputs', True):
+            logger.info("⚡ Text encoders kept in VRAM for real-time encoding")
+            if not getattr(self.config, 'train_text_encoder', False):
+                for idx, te in enumerate(self.model.text_encoders or []):
+                    if te is not None:
+                        te.eval()
+                        for param in te.parameters():
+                            param.requires_grad = False
+            for _, backend in StateTracker.get_data_backends().items():
+                if "text_embed_cache" in backend:
+                    backend["text_embed_cache"].skip_cache_mode = True
+            self.accelerator.wait_for_everyone()
+            return
+
         if self.config.model_type != "full" and self.config.train_text_encoder:
             return
         memory_before_unload = self.stats_memory_used()
@@ -2397,7 +2485,6 @@ class Trainer:
         fsdp_version = getattr(self.config, "fsdp_version", 1)
         fsdp_enabled = getattr(self.config, "fsdp_enable", False)
         is_fsdp2_run = fsdp_enabled and fsdp_version == 2 and self.accelerator.distributed_type == DistributedType.FSDP
-
         should_log = self.accelerator.is_main_process
         instantiate_on_rank = should_log or is_fsdp2_run
         if should_log:
