@@ -327,6 +327,22 @@ class TextEmbeddingCache(WebhookMixin):
             load_from_cache = False
         should_encode = not load_from_cache or self.skip_cache_mode
         args = StateTracker.get_args()
+        
+        # === ON-THE-FLY: ENCODE WHOLE BATCH AT ONCE ===
+        if should_encode and return_concat and prompts:
+            logger.debug(f"On-the-fly encoding batch of {len(prompts)} prompts")
+            with torch.no_grad():
+                text_encoder_output = self.model.encode_text_batch(prompts, is_negative_prompt=is_negative_prompt)
+                if "add_text_embeds" in text_encoder_output and "pooled_prompt_embeds" not in text_encoder_output:
+                    text_encoder_output["pooled_prompt_embeds"] = text_encoder_output["add_text_embeds"]
+                text_encoder_output = move_dict_of_tensors_to_device(
+                    tensors=text_encoder_output, 
+                    device=self.accelerator.device
+                )
+            logger.debug(f"On-the-fly batch encoding complete: {gather_dict_of_tensors_shapes(text_encoder_output)}")
+            return text_encoder_output
+        # === END ON-THE-FLY ===
+        
         if should_encode:
             if self.text_encoders is None or all(te is None for te in self.text_encoders):
                 raise RuntimeError("Text encoders not loaded")
