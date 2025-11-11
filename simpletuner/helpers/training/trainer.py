@@ -388,35 +388,7 @@ class Trainer:
 
         self.configure_webhook(raw_config=args_payload if isinstance(args_payload, dict) else args)
         self.config = load_config(args_payload, exit_on_error=exit_on_error)
-        # ============ Text Encoder Cache & Optimization Config ============
-        # Auto-detect if we should use real-time encoding instead of pre-caching
-        if not hasattr(self.config, 'cache_text_encoder_outputs'):
-            caption_strategy = getattr(self.config, 'caption_strategy', '').lower()
-            self.config.cache_text_encoder_outputs = caption_strategy not in ['shuffle', 'random']
-        
-        # Convert string to boolean if user provided it as string in config
-        if isinstance(self.config.cache_text_encoder_outputs, str):
-            self.config.cache_text_encoder_outputs = self.config.cache_text_encoder_outputs.lower() in ['true', '1', 'yes']
-        
-        # Set default for SDPA (PyTorch 2.0 scaled dot product attention)
-        if not hasattr(self.config, 'text_encoder_use_attention_sdpa'):
-            self.config.text_encoder_use_attention_sdpa = True
-        
-        # Set default for optional torch.compile
-        if not hasattr(self.config, 'text_encoder_compile'):
-            self.config.text_encoder_compile = False
-        
-        # Set default compile mode
-        if not hasattr(self.config, 'text_encoder_compile_mode'):
-            self.config.text_encoder_compile_mode = "max-autotune-no-cudagraphs"
-        
-        # Set default precision for text encoders
-        if not hasattr(self.config, 'text_encoder_precision'):
-            self.config.text_encoder_precision = "bf16"
-        
-        # Log the cache status
-        logger.info(f"Text embedding cache: {'ENABLED' if self.config.cache_text_encoder_outputs else 'DISABLED (on-the-fly)'}")
-        
+
         if self.config is None and args_payload and not skip_config_fallback:
             # Fallback to the user's persisted defaults when ad-hoc CLI args are incomplete.
             # This mirrors historical behaviour where we would silently load the active
@@ -1650,6 +1622,16 @@ class Trainer:
 
     def _misc_init(self):
         """things that do not really need an order."""
+        # === РҐРђР Р”РљРћР”: Р’РЎР•Р“Р”Рђ ON-THE-FLY ENCODING ===
+        if hasattr(self, 'config') and self.config is not None:
+            self.config.cache_text_encoder_outputs = False
+            self.config.text_encoder_use_attention_sdpa = True
+            self.config.text_encoder_compile = False
+            self.config.text_encoder_compile_mode = "max-autotune-no-cudagraphs"
+            self.config.text_encoder_precision = "bf16"
+            logger.info("вљЎ Text embedding cache: DISABLED (on-the-fly encoding enabled)")
+        # === РљРћРќР•Р¦ РҐРђР Р”РљРћР”Рђ ===
+        
         torch.set_num_threads(self.config.torch_num_threads)
         self.state = {}
         self.state["lr"] = 0.0
@@ -2000,7 +1982,7 @@ class Trainer:
     def init_unload_text_encoder(self):
         # NEW: keep TE loaded for real-time encoding
         if not getattr(self.config, 'cache_text_encoder_outputs', True):
-            logger.info("⚡ Text encoders kept in VRAM for real-time encoding")
+            logger.info("вљЎ Text encoders kept in VRAM for real-time encoding")
             if not getattr(self.config, 'train_text_encoder', False):
                 for idx, te in enumerate(self.model.text_encoders or []):
                     if te is not None:
