@@ -45,18 +45,22 @@ def _encode_sd3_prompt_with_t5(
     dtype = text_encoder.dtype
     prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
 
-    _, seq_len, _ = prompt_embeds.shape
+    _, seq_len, hidden = prompt_embeds.shape
+    attention_mask = text_inputs.attention_mask.to(device)
 
     # duplicate text embeddings and attention mask for each generation per prompt, using mps friendly method
     prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
     prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
-    attention_mask = text_inputs.attention_mask.to(device)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(f"[T5] prompt_embeds: {prompt_embeds.shape} (B={batch_size}, seq={seq_len}, hidden={hidden})")
 
     if zero_padding_tokens:
-        # for some reason, SAI's reference code doesn't bother to mask the prompt embeddings.
-        # this can lead to a problem where the model fails to represent short and long prompts equally well.
-        # additionally, the model learns the bias of the prompt embeds' noise.
-        return prompt_embeds * attention_mask.unsqueeze(-1).expand(prompt_embeds.shape)
+        # Mask out padding to avoid biasing learning
+        masked = prompt_embeds * attention_mask.unsqueeze(-1).expand(prompt_embeds.shape)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(f"[T5] attention_mask: {attention_mask.shape}, masked_embeds: {masked.shape}")
+        return masked
     else:
         return prompt_embeds
 
@@ -82,16 +86,22 @@ def _encode_sd3_prompt_with_clip(
     text_input_ids = text_inputs.input_ids
     prompt_embeds = text_encoder(text_input_ids.to(device), output_hidden_states=True)
 
-    pooled_prompt_embeds = prompt_embeds[0]
-    prompt_embeds = prompt_embeds.hidden_states[-2]
-    prompt_embeds = prompt_embeds.to(dtype=text_encoder.dtype, device=device)
+    pooled_prompt_embeds = prompt_embeds[0]  # (B, D)
+    tok_hidden = prompt_embeds.hidden_states[-2]  # (B, seq, H)
+    tok_hidden = tok_hidden.to(dtype=text_encoder.dtype, device=device)
 
-    _, seq_len, _ = prompt_embeds.shape
+    _, seq_len, hidden = tok_hidden.shape
+
     # duplicate text embeddings for each generation per prompt, using mps friendly method
-    prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1)
+    tok_hidden = tok_hidden.repeat(1, num_images_per_prompt, 1)
+    tok_hidden = tok_hidden.view(batch_size * num_images_per_prompt, seq_len, -1)
 
-    return prompt_embeds, pooled_prompt_embeds
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            f"[CLIP] token_hidden: {tok_hidden.shape} (B={batch_size}, seq={seq_len}, hidden={hidden}); pooled: {pooled_prompt_embeds.shape}"
+        )
+
+    return tok_hidden, pooled_prompt_embeds
 
 
 class SD3(ImageModelFoundation):
@@ -227,10 +237,22 @@ class SD3(ImageModelFoundation):
         """
         prompt_embeds, pooled_prompt_embeds = text_embedding
 
-        return {
-            "prompt_embeds": prompt_embeds,
-            "pooled_prompt_embeds": pooled_prompt_embeds.squeeze(0),
+        # Keep batch dimension intact for pooled embeddings. No squeeze!
+        out = {
+            "prompt_embeds": prompt_embeds,                 # (B, 231, H_total)
+            "pooled_prompt_embeds": pooled_prompt_embeds,   # (B, D_total)
         }
+
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                logger.debug(
+                    f"[SD3._format_text_embedding] prompt_embeds: {out['prompt_embeds'].shape}, "
+                    f"pooled_prompt_embeds: {out['pooled_prompt_embeds'].shape}"
+                )
+            except Exception:
+                pass
+
+        return out
 
     def convert_text_embed_for_pipeline(self, text_embedding: torch.Tensor) -> dict:
         # logger.info(f"Converting embeds with shapes: {text_embedding['prompt_embeds'].shape} {text_embedding['pooled_prompt_embeds'].shape}")
@@ -265,8 +287,10 @@ class SD3(ImageModelFoundation):
             clip_prompt_embeds_list.append(prompt_embeds)
             clip_pooled_prompt_embeds_list.append(pooled_prompt_embeds)
 
-        clip_prompt_embeds = torch.cat(clip_prompt_embeds_list, dim=-1)
-        pooled_prompt_embeds = torch.cat(clip_pooled_prompt_embeds_list, dim=-1)
+        # Concatenate CLIP token-level embeddings and pooled projections
+        clip_prompt_embeds = torch.cat(clip_prompt_embeds_list, dim=-1)           # (B, seq_clip, H_clip_total)
+        pooled_prompt_embeds = torch.cat(clip_pooled_prompt_embeds_list, dim=-1)  # (B, D_clip_total)
+
         zero_padding_tokens = True if self.config.t5_padding == "zero" else False
         t5_prompt_embed = _encode_sd3_prompt_with_t5(
             self.text_encoders[-1],
@@ -276,17 +300,44 @@ class SD3(ImageModelFoundation):
             device=self.accelerator.device,
             zero_padding_tokens=zero_padding_tokens,
             max_sequence_length=self.config.tokenizer_max_length,
-        )
+        )  # (B, seq_t5, H_t5)
 
-        clip_prompt_embeds = torch.nn.functional.pad(
-            clip_prompt_embeds,
-            (0, t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1]),
-        )
+        # Make feature dimensions align (pad CLIP features to T5 hidden size if needed)
+        if t5_prompt_embed.shape[-1] != clip_prompt_embeds.shape[-1]:
+            pad_features = t5_prompt_embed.shape[-1] - clip_prompt_embeds.shape[-1]
+            if pad_features < 0:
+                raise ValueError(
+                    f"CLIP hidden ({clip_prompt_embeds.shape[-1]}) larger than T5 hidden ({t5_prompt_embed.shape[-1]}) — cannot pad negative."
+                )
+            clip_prompt_embeds = torch.nn.functional.pad(clip_prompt_embeds, (0, pad_features))  # pad last dim
+
+        # Concat across sequence dimension: [CLIP tokens; T5 tokens] -> (B, seq_clip + seq_t5, H_aligned)
         prompt_embeds = torch.cat([clip_prompt_embeds, t5_prompt_embed], dim=-2)
+
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                logger.debug(
+                    f"[SD3._encode_prompts] B={prompt_embeds.shape[0]} | "
+                    f"CLIP tok: {clip_prompt_embeds.shape}, T5 tok: {t5_prompt_embed.shape}, "
+                    f"Combined prompt_embeds: {prompt_embeds.shape}, pooled: {pooled_prompt_embeds.shape}"
+                )
+            except Exception:
+                pass
 
         return prompt_embeds, pooled_prompt_embeds
 
     def model_predict(self, prepared_batch):
+        if logger.isEnabledFor(logging.DEBUG):
+            try:
+                logger.debug(
+                    f"[SD3.model_predict] noisy_latents: {prepared_batch['noisy_latents'].shape}, "
+                    f"timesteps: {prepared_batch['timesteps'].shape if hasattr(prepared_batch['timesteps'],'shape') else prepared_batch['timesteps']}, "
+                    f"encoder_hidden_states: {prepared_batch['encoder_hidden_states'].shape}, "
+                    f"add_text_embeds: {prepared_batch['add_text_embeds'].shape if 'add_text_embeds' in prepared_batch else 'None'}"
+                )
+            except Exception:
+                pass
+
         return {
             "model_prediction": self.model(
                 hidden_states=prepared_batch["noisy_latents"].to(
